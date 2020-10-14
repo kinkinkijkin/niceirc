@@ -4,19 +4,19 @@ import streams, os, asyncnet, asyncdispatch, strutils, terminal
 
 type
     ClientInfoHere = object
-        var descriptor, channel, username, nick: string
-        var sock: AsyncSocket
-        var incoming, outgoing: StringStream
+        descriptor, channel, username, nick: string
+        sock: AsyncSocket
+        incoming, outgoing: StringStream
 
 var statusline: string = ""
 
-var this: ClientInfoHere = new ClientInfoHere
+var this: ClientInfoHere
 
 var linepersist: string = newString(400)
 
 proc readFromDae() {.async.} =
     while true:
-        this.incoming.writeLine(await this.sock.readLine())
+        this.incoming.writeLine(await this.sock.recvLine())
 
 proc readToDae() {.async.} = 
     while true:
@@ -29,7 +29,7 @@ proc restoreUserline() =
     write(stdout, "<" & this.nick & ">" & linepersist)
 
 proc readFromInput() {.async.} =
-    readLine(stdin, linepersist)
+    discard readLine(stdin, linepersist)
     this.outgoing.writeLine("PRIVMSG " & this.channel & " :" & linepersist)
     linepersist = newString(400)
 
@@ -46,15 +46,15 @@ proc prodServer() {.async.} =
     await connectUnix(tempsock, getHomeDir() & ".nicesockMAST")
     var cmdline = commandLineParams()
     var toMast = "NEW " & cmdline.join(" ")
-    await tempsock.sendLine(toMast)
+    await tempsock.send(toMast)
     this.descriptor = cmdline[2]
     this.channel = cmdline[1]
     #this upcoming line is a testing hack i really dont want to implement this properly right now
     this.nick = cmdline[3]
 
-await prodServer()
+waitFor prodServer()
 sleep(1000)
-await connectUnix(this.sock, getHomeDir() & ".nicesock-" & descriptor)
+waitFor connectUnix(this.sock, getHomeDir() & ".nicesock-" & this.descriptor)
 
 asyncCheck readFromDae()
 asyncCheck readToDae()
@@ -62,5 +62,5 @@ asyncCheck readToDae()
 var shouldQuit: bool = false
 
 while not shouldQuit:
-    await updateBuffer()
+    waitFor updateBuffer()
     sleep(700)
