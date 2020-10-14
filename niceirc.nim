@@ -1,21 +1,27 @@
 import asyncnet, asyncdispatch, streams, os, strutils
 
-#Configuration type, for storing configuration from a file.
 type
+    #Configuration type, for storing configuration from a file.
     ConfigServ* = object
         var isCalled*, nick*, username*, realname*,
         pass*, servAddr*: string
         var servPort*: int = 6667
         var reqPass*: bool = false
-    
+    #Type for a current running client
     ClientInfo* = object
-        var name, channel: string
-        var ssock, csock: AsyncSocket
-        var instream, outstream: StringStream
+        var name*, channel*: string
+        var ssock*, csock*: AsyncSocket
+        var instream*, outstream*: StringStream
+    #Type for storing which servers are already open, and what clients they send to
+    ClientInfoList* = object
+        var serverName*: string
+        var clientRefs*: seq[ref ClientInfo]
+        var sock*: ref AsyncSocket #Convenience member
 
 #Currently connected servers and loaded configurations
 var clients: seq[ClientInfo]
 var serverconfs: seq[ConfigServ]
+var connectedservs: seq[ClientInfoList] = @[]
 
 #Make lines for the UI client. Currently very simple, to be extended in the future
 proc makeUILine(line, senderName: string): string =
@@ -34,11 +40,19 @@ proc sendInLines(c: ClientInfo) {.async.} =
 
 #Sort through messages to only show what's relevant and implemented
 proc messageFilterAndUI(mesg: string, c: ClientInfo) {.async.} =
-    if mesg.contains("PRIVMSG") and mesg.splitWhitespace[2].contains(c.channel):
+    #Internal daemon-ui messages
+    if mesg.startsWith("internal"):
+        var body = mesg
+        body.removePrefix("internal")
+        c.instream.writeLine("DAEMON " & body)
+        return
+    #Channel and private messages
+    elif mesg.contains("PRIVMSG") and mesg.splitWhitespace[2].contains(c.channel):
         var body = mesg.split(':')[3]
         var sender = mesg.split('!')[0]
         sender.removePrefix(":")
         c.instream.writeLine(sender & " " & body)
+        return
 
 #Recieve messages from the server and add to processing list
 proc getInFromServer(server: AsyncSocket, sname: string, lstream: StringStream) {.async.} =
@@ -56,22 +70,50 @@ proc openClientUi(cui: var AsyncSocket, s: ConfigServ, cn: string) {.async.} =
     await bindUnix(cui, getHomeDir() & sockname)
     await cui.send("Client UI socket opened for " & cn & " at " & sockname)
 
+proc closeClientUi(c: ClientInfo) =
+    c.csock.close()
+    c.ssock.close()
+
 #Open the IPC interface for clients to request new clients to be made on
 proc openClientListener(clist: var AsyncSocket) {.async.} =
     clist = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_RAW)
     await bindUnix(clist, getHomeDir() & ".nicesockMAST")
 
+proc closeClientListener(clist: var AsyncSocket) =
+    await close(clist)
+
 #Open communications with server
-proc openCommunications(server: var AsyncSocket, s: ConfigServ, msg: var string) {.async.} =
-    msg = "Connecting to " & s.isCalled
-    server = await dial(s.servAddr, s.servPort.Port)
-    msg = msg & "\nConnected to " & s.isCalled & " has succeeded"
-    if s.reqPass:
-        await server.send("PASS " & s.pass)
-    msg = msg & "\nRegistering connection with nick " & s.nick
-    await server.send("NICK " & s.nick)
-    await server.send("USER " & s.username & " 0 * :" & s.realname)
-    msg = msg & "\nPassoff from server opening proc"
+proc openCommunications(client: var ClientInfo, s: ConfigServ, msg: var string) {.async.} =
+    var check: bool
+    block performCheck:
+        for cs in connectedservs:
+            if s.isCalled == cs.serverName:
+                check = true
+                client.ssock = cs.sock[]
+                break performCheck
+    if not check: 
+        msg = "Connecting to " & s.isCalled
+        client.ssock = await dial(s.servAddr, s.servPort.Port)
+        msg = msg & "\nConnecting to " & s.isCalled & " has succeeded"
+        if s.reqPass:
+            await client.ssock.send("PASS " & s.pass)
+        msg = msg & "\nRegistering connection with nick " & s.nick
+        await client.ssock.send("NICK " & s.nick)
+        await client.ssock.send("USER " & s.username & " 0 * :" & s.realname)
+        msg = msg & "\nPassoff from server opening proc"
+        connectedservs.add((s.isCalled, @[ref client[]], ref client[].ssock))
+    else:
+        msg = "Server already open, passing on to channel connection\n"
+        connectedservs.clientRefs.add(ref client[])
+
+proc closeDaemon(clist: AsyncSocket) = 
+    for server in connectedservs:
+        for uiclient in server.clientRefs:
+            uiclient.closeClientUi()
+    connectedservs.free()
+    serverconfs.free()
+    closeClientListener(clist)
+    quit(0)
 
 #Initialize the UI client's relevant data and start connections
 proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo =
@@ -84,10 +126,77 @@ proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo 
     var messages1 = ""
 
     await openClientUi(result.csock, server, result.name)
-    await openCommunications(result.ssock, server, messages1)
+    await openCommunications(result, server, messages1)
+    await messageFilterAndUI(messages1, result)
+    await result.sendInLines()
 
+    return result
 
 
 var nClientListener: AsyncSocket
 
 await openClientListener(nClientListener)
+
+#Listen for client requests
+proc clientListen() {.async.} = 
+    var reader: string = await nClientListener.readLine()
+    var readerSplit: seq[string] = reader.splitWhitespace()
+    var thisClient = new ClientInfo
+    var serverMatch: bool = false
+    if readerSplit[0] == "STOP":
+        closeDaemon(nClientListener)
+    elif readerSplit[0] == "NEW":
+        #Parsing state machine. Can be done better. Don't care.
+        var thisNewServ: ConfigServ = new ConfigServ
+        for confline in lines(readerSplit[1]):
+            if confline.startsWith("CALLED:"):
+                var tmp1 = confline
+                tmp1.removePrefix("CALLED:")
+                thisNewServ.isCalled = tmp1
+            elif confline.startsWith("NICK:"):
+                var tmp1 = confline
+                tmp1.removePrefix("NICK:")
+                thisNewServ.nick = tmp1
+            elif confline.startsWith("USERNAME:"):
+                var tmp1 = confline
+                tmp1.removePrefix("USERNAME:")
+                thisNewServ.username = tmp1
+            elif confline.startsWith("REALNAME:"):
+                var tmp1 = confline
+                tmp1.removePrefix("REALNAME:")
+                thisNewServ.realname = tmp1
+            elif confline.startsWith("PASSREQ:"):
+                var tmp1 = confline
+                tmp1.removePrefix("PASSREQ:")
+                thisNewServ.reqPass = tmp1.parseBool()
+            elif confline.startsWith("PASS:"):
+                var tmp1 = confline
+                tmp1.removePrefix("PASS:")
+                thisNewServ.pass = tmp1
+            elif confline.startsWith("ADDR:"):
+                var tmp1 = confline
+                tmp1.removePrefix("ADDR:")
+                thisNewServ.servAddr = tmp1
+            elif confline.startsWith("PORT:"):
+                var tmp1 = confline
+                tmp1.removePrefix("PORT:")
+                thisNewServ.port = tmp1.parseInt
+        block servCheck:
+            for se in serverconfs:
+                if thisNewServ.isCalled == se.isCalled:
+                    serverMatch = true
+                    break servCheck
+        if serverMatch:
+            #If the server is currently connected to, open client and add it to that server
+            var thisClient = startClient(readerSplit[2], readerSplit[3], thisNewServ)
+            for i in connectedservs.len:
+                if connectedservs[i].serverName == thisNewServ.name
+                    connectedservs[i].clientRefs.add(ref thisClient)
+        else:
+            #If the server isn't connected to yet, add server to the list while opening
+            var thisClient = startClient(readerSplit[2], readerSplit[3], thisNewServ)
+            serverconfs.add(thisNewServ)
+            var newServer: ClientInfoList = new ClientInfoList
+            newServer.serverName = thisNewServ.name
+            newServer.clientRefs.add(ref thisClient)
+            connectedservs.add(newServer)
