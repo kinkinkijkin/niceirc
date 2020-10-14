@@ -77,7 +77,6 @@ proc closeClientUi(c: ClientInfo) =
 
 #Open the IPC interface for clients to request new clients to be made on
 proc openClientListener(clist: AsyncSocket) {.async.} =
-    bindUnix(clist, getHomeDir() & ".nicesockMAST")
     clist.listen()
 
 proc closeClientListener(clist: var AsyncSocket) =
@@ -134,9 +133,13 @@ proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo 
     return result
 
 
-var nClientListener: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_RAW)
+var nClientListener: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_UDP)
 
-waitFor openClientListener(nClientListener)
+if not existsFile(getHomeDir() & "/.nicesockMAST"):
+    writeFile(getHomeDir() & "/.nicesockMAST", "")
+waitFor connectUnix(nClientListener, getHomeDir() & "/.nicesockMAST")
+
+nClientListener.listen()
 
 #Listen for client requests
 proc clientListen() {.async.} = 
