@@ -1,31 +1,56 @@
-import asyncnet, asyncdispatch, streams, os
+import asyncnet, asyncdispatch, streams, os, strutils
 
 #Configuration type, for storing configuration from a file.
 type
-    configServ = object
+    ConfigServ* = object
         var isCalled*, nick*, username*, realname*,
         pass*, servAddr*: string
         var servPort*: int = 6667
         var reqPass*: bool = false
+    
+    ClientInfo* = object
+        var name, channel: string
+        var ssock, csock: AsyncSocket
+        var instream, outstream: StringStream
 
 #Currently connected servers and loaded configurations
-var servs {.threadvar.}: seq[tuple[name: string, ssock: AsyncSocket, csock: AsyncSocket]]
-var configs {.threadvar.}: seq[configServ]
+var clients: seq[ClientInfo]
+var serverconfs: seq[ConfigServ]
 
-#Internal buffers with sorting by type and server
-var linesForClient, linesToProcIn, linesForServer, linesToProcOut:
-    seq[tuple[serverName: string, linestream: StringStream]]
+#Make lines for the UI client. Currently very simple, to be extended in the future
+proc makeUILine(line, senderName: string): string =
+    result = "< " & senderName & " > " & line
+    return result
+
+#Send lines to the UI client
+proc sendInLines(c: ClientInfo) {.async.} =
+    while not c.instream.atEnd():
+        var l = c.instream.readLine()
+        var ol: string
+        var fromNick = l.splitWhitespace()[0]
+        l.removePrefix(fromNick)
+        ol = makeUILine(l & "\n", fromNick)
+        await c.csock.send(ol)
+
+#Sort through messages to only show what's relevant and implemented
+proc messageFilterAndUI(mesg: string, c: ClientInfo) {.async.} =
+    if mesg.contains("PRIVMSG") and mesg.splitWhitespace[2].contains(c.channel):
+        var body = mesg.split(':')[3]
+        var sender = mesg.split('!')[0]
+        sender.removePrefix(":")
+        c.instream.writeLine(sender & " " & body)
 
 #Recieve messages from the server and add to processing list
-proc getInFromServer(server: AsyncSocket, sname: string) {.async.} =
+proc getInFromServer(server: AsyncSocket, sname: string, lstream: StringStream) {.async.} =
     while true:
         let line = await server.recvLine()
         if line.len == 0: break
         else:
-            linesToProcIn.add((sname, line))
+            lstream.writeLine(line)
+
 
 #Open communications with client UI
-proc openClientUi(cui: var AsyncSocket, s: configServ, cn: string) {.async.} =
+proc openClientUi(cui: var AsyncSocket, s: ConfigServ, cn: string) {.async.} =
     cui = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_RAW)
     var sockname = ".nicesock-" & cn
     await bindUnix(cui, getHomeDir() & sockname)
@@ -37,7 +62,7 @@ proc openClientListener(clist: var AsyncSocket) {.async.} =
     await bindUnix(clist, getHomeDir() & ".nicesockMAST")
 
 #Open communications with server
-proc openCommunications(server: var AsyncSocket, s: configServ, msg: var string) {.async.} =
+proc openCommunications(server: var AsyncSocket, s: ConfigServ, msg: var string) {.async.} =
     msg = "Connecting to " & s.isCalled
     server = await dial(s.servAddr, s.servPort.Port)
     msg = msg & "\nConnected to " & s.isCalled & " has succeeded"
@@ -48,6 +73,21 @@ proc openCommunications(server: var AsyncSocket, s: configServ, msg: var string)
     await server.send("USER " & s.username & " 0 * :" & s.realname)
     msg = msg & "\nPassoff from server opening proc"
 
+#Initialize the UI client's relevant data and start connections
+proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo =
+    result = new ClientInfo
+    result.instream = newStringStream("")
+    result.outstream = newStreamStream("")
+    result.channel = chname
+    result.name = clidesignator
+
+    var messages1 = ""
+
+    await openClientUi(result.csock, server, result.name)
+    await openCommunications(result.ssock, server, messages1)
+
+
+
 var nClientListener: AsyncSocket
 
-await openClientListener()
+await openClientListener(nClientListener)
