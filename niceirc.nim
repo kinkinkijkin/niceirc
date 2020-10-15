@@ -1,4 +1,4 @@
-import asyncnet, asyncdispatch, streams, os, strutils, nativesockets
+import asyncnet, asyncdispatch, net, streams, os, strutils
 
 type
     #Configuration type, for storing configuration from a file.
@@ -92,7 +92,7 @@ proc openCommunications(client: ClientInfo, s: ConfigServ) {.async.} =
                 break performCheck
     if not check: 
         var clinfo: ClientInfoList
-        clinfo.sock = await dial(s.servAddr, s.servPort.Port, buffered = true)
+        clinfo.sock = await asyncnet.dial(s.servAddr, s.servPort.Port, buffered = true)
         if s.reqPass:
             await client.ssock.send("PASS " & s.pass)
         await client.ssock.send("NICK " & s.nick)
@@ -121,7 +121,7 @@ proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo 
     result.outstream = newStringStream("")
     result.channel = chname
     result.name = clidesignator
-    result.csock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_RAW)
+    result.csock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
 
     var messages1 = ""
 
@@ -133,11 +133,12 @@ proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo 
     return result
 
 
-var nClientListener: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_UDP)
+var nClientListener: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
 
-if not existsFile(getHomeDir() & "/.nicesockMAST"):
-    writeFile(getHomeDir() & "/.nicesockMAST", "")
-waitFor connectUnix(nClientListener, getHomeDir() & "/.nicesockMAST")
+#if not existsFile(getHomeDir() & "/.nicesockMAST"):
+#    writeFile(getHomeDir() & "/.nicesockMAST", "")
+
+nClientListener.bindUnix(getHomeDir() & "/.nicesockMAST")
 
 nClientListener.listen()
 
