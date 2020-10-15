@@ -1,0 +1,10 @@
+CALLED:examplefreenode
+NICK:niceuser
+USERNAME:niceirc
+REALNAME:NICEirc user
+PASSREQ:0
+PASS:
+ADDR:irc.freenode.net
+PORT:6667
+
+any line that does not start with one of the above prefixes is treated as a comment.
