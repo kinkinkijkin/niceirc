@@ -1,4 +1,4 @@
-import streams, os, asyncnet, asyncdispatch, strutils, terminal
+import streams, os, asyncnet, asyncdispatch, net, strutils, terminal
 
 #This file is currently a dummy tester
 
@@ -11,18 +11,23 @@ type
 var statusline: string = ""
 
 var this: ClientInfoHere
+this.incoming = newStringStream("")
+this.outgoing = newStringStream("")
 
 var linepersist: string = newString(400)
 
 proc readFromDae() {.async.} =
     while true:
+        sleep(200)
         this.incoming.writeLine(await this.sock.recvLine())
 
 proc readToDae() {.async.} = 
     while true:
+        sleep(200)
         while not this.outgoing.atEnd():
             await this.sock.send(this.outgoing.readLine())
         this.outgoing.flush()
+
 
 proc restoreUserline() =
     eraseLine()
@@ -30,8 +35,14 @@ proc restoreUserline() =
 
 proc readFromInput() {.async.} =
     discard readLine(stdin, linepersist)
-    this.outgoing.writeLine("PRIVMSG " & this.channel & " :" & linepersist)
-    linepersist = newString(400)
+    if not linepersist.startsWith("/"):
+        this.outgoing.writeLine("PRIVMSG " & this.channel & " :" & linepersist)
+        linepersist = newString(400)
+    else:
+        linepersist.removePrefix("/")
+        if linepersist.startsWith("NICK "): this.nick = linepersist.splitWhitespace()[1]
+        this.outgoing.writeLine(linepersist)
+        linepersist = newString(400)
 
 proc updateBuffer() {.async.} =
     while not this.incoming.atEnd():
@@ -42,10 +53,13 @@ proc updateBuffer() {.async.} =
     return
 
 proc prodServer() {.async.} =
-    var tempsock: AsyncSocket
-    await connectUnix(tempsock, getHomeDir() & ".nicesockMAST")
+    var tempsock: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+    await tempsock.connectUnix(getHomeDir() & "/.nicesockMAST")
     var cmdline = commandLineParams()
-    var toMast = "NEW " & cmdline.join(" ")
+    if cmdline.len == 0:
+        echo "please enter the command with [servcfgfile] [channel] [internalname] [clientnick]"
+        quit(21)
+    var toMast = "NEW " & cmdline.join(" ") & "\n"
     await tempsock.send(toMast)
     this.descriptor = cmdline[2]
     this.channel = cmdline[1]
@@ -54,13 +68,13 @@ proc prodServer() {.async.} =
 
 waitFor prodServer()
 sleep(1000)
-waitFor connectUnix(this.sock, getHomeDir() & ".nicesock-" & this.descriptor)
+this.sock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+waitFor connectUnix(this.sock, getHomeDir() & "/.nicesock-" & this.descriptor)
 
 asyncCheck readFromDae()
 asyncCheck readToDae()
 
 var shouldQuit: bool = false
 
-while not shouldQuit:
-    waitFor updateBuffer()
-    sleep(700)
+asyncCheck updateBuffer()
+runForever()

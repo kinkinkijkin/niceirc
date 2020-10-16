@@ -5,12 +5,13 @@ type
     ConfigServ* = object
         isCalled*, nick*, username*, realname*,
             pass*, servAddr*: string
+        bnicks: seq[string]
         servPort*: int
         reqPass*: bool
     #Type for a current running client
     ClientInfo* = object
         name*, channel*: string
-        ssock*, csock*: AsyncSocket
+        csock*: AsyncSocket
         instream*, outstream*: StringStream
     #Type for storing which servers are already open, and what clients they send to
     ClientInfoList* = object
@@ -41,13 +42,14 @@ proc sendInLines() {.async.} =
         c.instream.flush()
 
 proc sendOutLines() {.async.} =
-    for c in clients:
-        while not c.outstream.atEnd():
-            var l = c.outstream.readLine()
-            var fl: string
-            fl = "PRIVMSG " & c.channel & " :" & l
-            await c.ssock.send(fl)
-        c.instream.flush()
+    for s in connectedservs:
+        for c in s.clientRefs:
+            while not c.outstream.atEnd():
+                var l = c.outstream.readLine()
+                var fl: string
+                fl = "PRIVMSG " & c.channel & " :" & l
+                await s.sock.send(fl)
+            c.outstream.flush()
 
 #Sort through messages to only show what's relevant and implemented
 proc messageFilterAndUI(mesg: string, c: ClientInfo) {.async.} =
@@ -55,25 +57,30 @@ proc messageFilterAndUI(mesg: string, c: ClientInfo) {.async.} =
     if mesg.startsWith("internal"):
         var body = mesg
         body.removePrefix("internal")
-        c.instream.writeLine("DAEMON " & body)
+        c.instream.writeLine("DAEMON " & body & "\n")
         return
     #Channel and private messages
     elif mesg.contains("PRIVMSG"):
         var body = mesg.split(':')[3]
         var sender = mesg.split('!')[0]
         sender.removePrefix(":")
-        c.instream.writeLine(sender & " " & body)
+        c.instream.writeLine(sender & " " & body & "\n")
         return
+    else:
+        c.instream.writeLine(mesg & "\n")
 
 #Open communications with client UI
-proc openClientUi(cui: AsyncSocket, s: ConfigServ, cn: string) {.async.} =
-    var sockname = ".nicesock-" & cn
-    bindUnix(cui, getHomeDir() & sockname)
-    await cui.send("Client UI socket opened for " & cn & " at " & sockname)
+proc openClientUi(cui: AsyncSocket, s: ConfigServ, cn: string): Future[AsyncSocket] {.async.} =
+    var sockname = "/.nicesock-" & cn
+    if not tryRemoveFile(getHomeDir() & sockname):
+        echo "client socket exists and cannot be removed"
+        quit(22)
+    cui.bindUnix(getHomeDir() & sockname)
+    cui.listen()
+    return await cui.accept()
 
 proc closeClientUi(c: ClientInfo) =
     c.csock.close()
-    c.ssock.close()
 
 #Open the IPC interface for clients to request new clients to be made on
 proc openClientListener(clist: AsyncSocket) {.async.} =
@@ -83,7 +90,7 @@ proc closeClientListener(clist: var AsyncSocket) =
     close(clist)
 
 #Open communications with server
-proc openCommunications(client: ClientInfo, s: ConfigServ) {.async.} =
+proc openCommunications(client: ClientInfo, s: ConfigServ): Future[AsyncSocket] {.async.} =
     var check: bool
     block performCheck:
         for cs in connectedservs:
@@ -94,17 +101,18 @@ proc openCommunications(client: ClientInfo, s: ConfigServ) {.async.} =
         var clinfo: ClientInfoList
         clinfo.sock = await asyncnet.dial(s.servAddr, s.servPort.Port, buffered = true)
         if s.reqPass:
-            await client.ssock.send("PASS " & s.pass)
-        await client.ssock.send("NICK " & s.nick)
-        await client.ssock.send("USER " & s.username & " 0 * :" & s.realname)
+            await clinfo.sock.send("PASS " & s.pass)
+        await clinfo.sock.send("NICK " & s.nick)
+        await clinfo.sock.send("USER " & s.username & " 0 * :" & s.realname)
         clinfo.serverName = s.isCalled
         clinfo.clientRefs = @[client]
         connectedservs.add(clinfo)
+        return clinfo.sock
     else:
         for i in 0..(connectedservs.len-1):
             if s.isCalled == connectedservs[i].serverName:
                 connectedservs[i].clientRefs.add(client)
-                break
+                return connectedservs[i].sock
         
 
 proc closeDaemon(clist: var AsyncSocket) = 
@@ -121,37 +129,43 @@ proc startClient(chname, clidesignator: string, server: ConfigServ): ClientInfo 
     result.outstream = newStringStream("")
     result.channel = chname
     result.name = clidesignator
-    result.csock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+    var tmpsock = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
 
     var messages1 = ""
 
-    waitFor openClientUi(result.csock, server, result.name)
-    waitFor openCommunications(result, server)
+    result.csock = waitFor openClientUi(tmpsock, server, result.name)
+    var tmpsock2 = waitFor openCommunications(result, server)
     waitFor messageFilterAndUI(messages1, result)
     waitFor sendInLines()
+    waitFor tmpsock2.send("JOIN " & result.channel)
 
     return result
 
 
 var nClientListener: AsyncSocket = newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
 
-#if not existsFile(getHomeDir() & "/.nicesockMAST"):
-#    writeFile(getHomeDir() & "/.nicesockMAST", "")
+#Try to clear the sockfile if it exists, fail if it exists and we can't remove it
+if not tryRemoveFile(getHomeDir() & "/.nicesockMAST"):
+    echo "master socket file exists and cannot be removed. \"~/.nicesockMAST\" is its name."
+    quit(22)
 
 nClientListener.bindUnix(getHomeDir() & "/.nicesockMAST")
 
 nClientListener.listen()
 
 #Listen for client requests
-proc clientListen() {.async.} = 
+proc clientListen(onepass: bool) {.async.} = 
     while true:
-        var reader: string = await nClientListener.recvLine()
+        var newsock = await nClientListener.accept()
+        echo "accepted"
+        var reader: string = await newsock.recvLine()
+        echo reader
         var readerSplit: seq[string] = reader.splitWhitespace()
         var thisClient = new ClientInfo
         var serverMatch: bool = false
         if readerSplit[0] == "STOP":
             closeDaemon(nClientListener)
-        elif readerSplit[0] == "NEW":
+        elif readerSplit[0].startsWith("NEW"):
             #Parsing state machine. Can be done better. Don't care.
             var thisNewServ: ConfigServ
             for confline in lines(readerSplit[1]):
@@ -163,6 +177,10 @@ proc clientListen() {.async.} =
                     var tmp1 = confline
                     tmp1.removePrefix("NICK:")
                     thisNewServ.nick = tmp1
+                elif confline.startsWith("BNICK:"):
+                    var tmp1 = confline
+                    tmp1.removePrefix("BNICK:")
+                    thisNewServ.bnicks.add(tmp1)
                 elif confline.startsWith("USERNAME:"):
                     var tmp1 = confline
                     tmp1.removePrefix("USERNAME:")
@@ -208,17 +226,17 @@ proc clientListen() {.async.} =
                 newServer.serverName = thisNewServ.isCalled
                 newServer.clientRefs.add(thisClient)
                 clients.add(thisClient)
-                newServer.sock = thisClient.ssock
-                connectedservs.add(newServer)
+        if onepass: break
 
-asyncCheck clientListen()
+waitFor clientListen(true)
 
 #Checks if servers have sent anything our way
 proc checkServers() {.async.} =
-    for s in connectedservs:
-        var msgFromServer = await s.sock.recvLine()
-        if not (msgFromServer.len == 0):
-            if msgFromServer.contains("PRIVMSG"):
+    while true:
+        for s in connectedservs:
+            var msgFromServer = await s.sock.recvLine()
+            if not (msgFromServer.len == 0):
+#                if msgFromServer.contains("PRIVMSG"):
                 for cli in s.clientRefs:
                     if msgFromServer.splitWhitespace()[2] == cli.channel:
                         await messageFilterAndUI(msgFromServer, cli)
@@ -227,17 +245,20 @@ asyncCheck checkServers()
 
 #Checks if the clients have anything to send to their servers
 proc checkBuffers() {.async.} =
-    for c in clients:
-        var msgForServer = await c.csock.recvLine()
-        if not (msgForServer.len == 0):
-            c.outstream.writeLine(msgForServer)
+    while true:
+        for c in clients:
+            var msgForServer = await c.csock.recvLine()
+            if not (msgForServer.len == 0):
+                c.outstream.writeLine(msgForServer)
 
 asyncCheck checkBuffers()
 
 #Continuously runs the send procs
 proc middleManProc() {.async.} =
     while true:
-        asyncCheck sendInLines()
-        asyncCheck sendOutLines()
+        await sendOutLines()
+        await sendInLines()
+        sleep(200)
 
 asyncCheck middleManProc()
+runForever()
